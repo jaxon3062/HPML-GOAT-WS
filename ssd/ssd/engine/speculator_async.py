@@ -84,7 +84,8 @@ class SpeculatorAsync(SpeculatorBase):
         dist.send(cmd, dst=self.draft_runner_rank, group=self.async_pg)
         dist.send(metadata, dst=self.draft_runner_rank, group=self.async_pg)
         send_int64(self.async_pg, self.draft_runner_rank,
-                   input_ids, num_tokens, draft_block_table.to(torch.int64))
+                   input_ids, num_tokens, draft_block_table.to(torch.int64),
+                   torch.tensor([seq.seq_id for seq in seqs], dtype=torch.int64, device=self.device))
         if eagle_acts is not None:
             dist.send(eagle_acts, dst=self.draft_runner_rank, group=self.async_pg)
         return SpeculateResult([], [])

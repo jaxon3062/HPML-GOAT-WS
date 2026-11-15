@@ -1,5 +1,6 @@
 import torch
 from ssd.config import Config
+from ssd.utils.suffix_fanout import boost_logits
 from transformers import AutoTokenizer
 
 @torch.inference_mode()
@@ -23,7 +24,7 @@ def make_glue_decode_input_ids(
     
     return out 
 
-def get_forked_recovery_tokens_from_logits(config: Config, logits: torch.Tensor, cache_hits: torch.Tensor, returned_tokens: torch.Tensor, tokenizer: AutoTokenizer):
+def get_forked_recovery_tokens_from_logits(config: Config, logits: torch.Tensor, cache_hits: torch.Tensor, returned_tokens: torch.Tensor, tokenizer: AutoTokenizer, boost: torch.Tensor | None = None):
     """
     logits: Float[Tensor] of shape [B, K+1, V]
     fan_out_list: list[int] of length K+1 with per-position topk, or int to use for all positions
@@ -44,6 +45,8 @@ def get_forked_recovery_tokens_from_logits(config: Config, logits: torch.Tensor,
     # Use scatter_ to set returned tokens to -inf so we don't include those in forked tokens 
     # Don't touch the last sequence position, only scatter the first K positions
     logits = logits.clone()
+    if boost is not None:  # [B, K+1] suffix-tree nominations, -1 = none
+        boost_logits(logits, boost)
     logits[:, :-1, :] = logits[:, :-1, :].scatter(
         dim=2,
         index=returned_tokens[:, 1:].unsqueeze(2),

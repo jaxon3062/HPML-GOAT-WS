@@ -38,6 +38,8 @@ def parse_arguments():
     parser.add_argument("--flh", type=int, nargs='+', default=None, help="Fan out list (e.g., --flh 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--flm", type=int, nargs='+', default=None, help="Fan out list miss (e.g., --flm 1 3 4 becomes [1, 3, 4])")
     parser.add_argument("--backup", type=str, choices=["jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
+    parser.add_argument("--suffix", action="store_true", help="Suffix-tree nominated fan-out (needs --spec --async and arctic-inference)")
+    parser.add_argument("--suffix_min_match", type=int, default=3, help="Minimum matched context length for a suffix nomination")
 
     # Memory and batching configuration
     parser.add_argument("--block_sz", type=int, default=256, help="KV cache block size (see config.py: kvcache_block_size)")
@@ -93,6 +95,8 @@ def create_run_name(args):
     spec_mode_str = "spec" if args.spec else "normal"
     async_mode_str = "_async" if getattr(args, 'async', False) else ""
     jit_mode_str = "_jit" if args.backup == "jit" else ""
+    if args.suffix:
+        jit_mode_str += f"_suffix{args.suffix_min_match}"
     model_type = "llama" if args.llama else "qwen"
     example_str = "_example" if args.example else ""
     humaneval_str = "_humaneval" if args.humaneval else ""
@@ -130,6 +134,8 @@ def initialize_wandb(args, run_name):
             "speculative_decoding": args.spec,
             "async_speculative": getattr(args, 'async', False),
             "jit_speculative": args.backup == "jit",
+            "suffix_fanout": args.suffix,
+            "suffix_min_match_len": args.suffix_min_match,
             "k": args.k if args.spec else None,
             "f": args.f,
             "fan_out_list": args.flh,
@@ -173,6 +179,8 @@ def create_llm_kwargs(args, draft_path):
         max_model_len=args.max_model_len,
         sampler_x=args.x,
         jit_speculate=(args.backup == "jit"),
+        suffix_fanout=args.suffix,
+        suffix_min_match_len=args.suffix_min_match,
         max_steps=args.max_steps,
     )
 

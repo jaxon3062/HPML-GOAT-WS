@@ -28,6 +28,10 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# Only for Config.suffix_fanout / bench --suffix. Install with --no-deps.
+suffix = [
+    "arctic-inference",
+]
 scripts = [
     "datasets",
     "huggingface_hub",

@@ -10,6 +10,7 @@ from ssd.utils.context import set_context, reset_context
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
 from ssd.utils.async_helpers.nccl_pack import recv_int64
 from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
+from ssd.utils.suffix_fanout import SuffixFanout
 
 PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
 
@@ -42,6 +43,8 @@ class DraftRunner(ModelRunner):
                 "EAGLE requires jit_speculate=True (cache misses need draft activations)"
 
         if self.is_draft and self.draft_async:
+            self._suffix = SuffixFanout(self.config.speculate_k, self.config.suffix_min_match_len) if self.config.suffix_fanout else None
+            self._suffix_hits = 0
             self._reset_tree_cache_tensors()
             self._init_prealloc_buffers()
             self._draft_step_times = []
@@ -62,13 +65,18 @@ class DraftRunner(ModelRunner):
             )
 
         # 2) receive fused int64 payload (input_ids + num_tokens + draft_block_table)
-        fused_total = total_new_tokens + batch_size + batch_size * max_blocks
+        fused_total = total_new_tokens + batch_size + batch_size * max_blocks + batch_size  # +seq_ids
         fused = recv_int64(self.async_pg, src=0, total_length=fused_total, device=self.device)
         off = 0
         input_ids = fused[off:off + total_new_tokens]; off += total_new_tokens
         num_tokens = fused[off:off + batch_size]; off += batch_size
         draft_block_table = fused[off:off + batch_size * max_blocks].view(batch_size, max_blocks).to(torch.int32); off += batch_size * max_blocks
+        seq_ids = fused[off:off + batch_size]; off += batch_size
         assert off == fused_total
+
+        if self._suffix is not None:
+            for sid, ids in zip(seq_ids.tolist(), input_ids.split(num_tokens.tolist())):
+                self._suffix.start(sid, ids.tolist())
 
         eagle_acts = None
         if use_eagle:
@@ -108,6 +116,7 @@ class DraftRunner(ModelRunner):
         self.tree_cache_tokens = None
         self.tree_cache_logits = None
         self.tree_cache_activations = None
+        self.tree_cache_boosted = None  # [N] bool, entries nominated by the suffix tree
 
     def _init_prealloc_buffers(self):
         # PERFORMANCE: pre-allocate constant tensors used every draft step to avoid repeated CUDA mallocs
@@ -218,6 +227,8 @@ class DraftRunner(ModelRunner):
             match = torch.all(eq, dim=2)  # [B,T]
             cache_hits = match.any(dim=1)  # [B]
             ttl_hit += int(cache_hits.sum().item())
+            if self.tree_cache_boosted is not None:
+                self._suffix_hits += int((match & self.tree_cache_boosted).any(dim=1).sum().item())
             
             if self.config.verbose:
                 print(f"[hit_cache_and_respond] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
@@ -374,6 +385,9 @@ class DraftRunner(ModelRunner):
             "extend_eagle_acts": extend_eagle_acts,
             "extend_token_ids": extend_token_ids,
         }
+        if self._suffix is not None:
+            # Read back to CPU now, before the glue decode is queued behind it.
+            partial_tree_decode_args["suffix_req"] = (cache_keys.tolist(), out_tokens.tolist())
 
         return glue_decode_input_ids, partial_tree_decode_args
 
@@ -648,6 +662,14 @@ class DraftRunner(ModelRunner):
 
         reset_context()
 
+        # Suffix-tree lookups run on CPU while the glue decode runs on GPU.
+        boost = None
+        if self._suffix is not None:
+            keys, outs = partial_tree_decode_args["suffix_req"]
+            boost = torch.tensor(
+                [self._suffix.nominate(sid, keep, rec, out[:K]) for (sid, keep, rec), out in zip(keys, outs)],
+                dtype=torch.int64, device=self.device)
+
         # --- Extract K+1 logits/prenorms at rec+spec positions ---
         if self.config.use_eagle:
             # Packed layout: rec at cu_seqlens_q[b] + n_ext[b], spec follows
@@ -693,7 +715,11 @@ class DraftRunner(ModelRunner):
             cache_hits,
             gd_for_fork,
             tokenizer=self.tokenizer,
+            boost=boost,
         ).view(-1)
+        boosted = None
+        if boost is not None:
+            boosted = forked_rec_tokens == boost[_pre_b_flat, _pre_j_idx_flat]
 
         tree_decode_args = {
             "metadata_ints": _pre_metadata_ints,
@@ -708,6 +734,7 @@ class DraftRunner(ModelRunner):
             "cache_hits_list": cache_hits_list,
         }
         tree_decode_args["hidden_states"] = tree_hidden_states
+        tree_decode_args["boosted"] = boosted
         return tree_decode_args
 
     @torch.inference_mode()
@@ -828,6 +855,7 @@ class DraftRunner(ModelRunner):
         self.tree_cache_tokens = tokens
         self.tree_cache_logits = logits
         self.tree_cache_activations = activations
+        self.tree_cache_boosted = payload["boosted"]
         
         # Print cache population details
         if self.config.verbose:
@@ -921,6 +949,9 @@ class DraftRunner(ModelRunner):
                 if self._draft_step_times:
                     avg_ms = sum(self._draft_step_times) * 1000 / len(self._draft_step_times)
                     print(f"[metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
+                if self._suffix is not None:
+                    print(f"[metrics] Suffix fan-out: {self._suffix.num_nominated} nominations, "
+                          f"{self._suffix_hits} of {ttl_hit} cache hits on a nominated entry", flush=True)
                 self.exit()
                 break
 

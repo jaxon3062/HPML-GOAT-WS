@@ -32,6 +32,10 @@ class Config:
     fan_out_list_miss: list[int] | None = None
     sampler_x: float | None = None 
     jit_speculate: bool = False 
+    # Optional: a suffix tree over prompt + accepted output nominates one fan-out
+    # token per position (ssd/utils/suffix_fanout.py). Off = original SSD fan-out.
+    suffix_fanout: bool = False
+    suffix_min_match_len: int = 3
 
     # eagle3
     use_eagle: bool = False 
@@ -56,6 +60,7 @@ class Config:
         self.hf_config = AutoConfig.from_pretrained(model)
         self.max_model_len = min(
             self.max_model_len, self.hf_config.max_position_embeddings) 
+        assert not self.suffix_fanout or (self.speculate and self.draft_async), "suffix_fanout needs async speculation"
         if self.speculate: 
             draft = self.draft
             self.draft_hf_config = AutoConfig.from_pretrained(draft)
