@@ -27,6 +27,8 @@ METRICS = {
     "accepted_suffix_lens_with_recovery": [],
     "accepted_suffix_lens_on_hit": [],  # Only for cache hits in async mode
     "accepted_suffix_lens_on_miss": [],  # Only for cache misses in async mode
+    "suffix_draft_rows": [],  # Fraction of rows per step whose speculation came from the suffix tree
+    "accepted_suffix_lens_on_suffix_draft": [],  # Those rows only (excluded from on_hit / on_miss)
     "prefill_total_time": 0,
     "decode_total_time": 0,
     "prefill_total_tokens": 0,
@@ -241,6 +243,11 @@ class LLMEngine:
             if self.config.draft_async:
                 print(
                     f"[metrics] Avg Cache Hits: {sum(METRICS['cache_hits']) / len(METRICS['cache_hits']):.2f}", flush=True)
+                if self.config.suffix_draft != "off" and METRICS['suffix_draft_rows']:
+                    print(f"[metrics] Avg Suffix Draft Rows: {sum(METRICS['suffix_draft_rows']) / len(METRICS['suffix_draft_rows']):.2f}", flush=True)
+                    lens = METRICS['accepted_suffix_lens_on_suffix_draft']
+                    if lens:
+                        print(f"[metrics] Avg Tokens per step on Suffix Draft: {sum(lens) / len(lens):.2f}", flush=True)
                 # Log separate metrics for cache hits
                 if METRICS['accepted_suffix_lens_on_hit']:
                     avg_suffix_len_on_hit = sum(

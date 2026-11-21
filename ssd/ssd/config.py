@@ -36,6 +36,12 @@ class Config:
     # token per position (ssd/utils/suffix_fanout.py). Off = original SSD fan-out.
     suffix_fanout: bool = False
     suffix_min_match_len: int = 3
+    suffix_global_requests: int = 0  # shared tree of past responses: 0 off, -1 unlimited, N = last N requests
+    # Optional: SuffixDecoding as the drafter. "miss": the suffix tree's continuation
+    # replaces the speculation on cache misses (skipping the JIT draft when it covers
+    # them all); "always": on any row. Used only if its score >= suffix_draft_min_score.
+    suffix_draft: str = "off"
+    suffix_draft_min_score: float = 1.0
 
     # eagle3
     use_eagle: bool = False 
@@ -61,6 +67,10 @@ class Config:
         self.max_model_len = min(
             self.max_model_len, self.hf_config.max_position_embeddings) 
         assert not self.suffix_fanout or (self.speculate and self.draft_async), "suffix_fanout needs async speculation"
+        assert self.suffix_draft in ("off", "miss", "always"), f"suffix_draft must be off, miss or always, got {self.suffix_draft}"
+        if self.suffix_draft != "off":
+            assert self.speculate and self.draft_async, "suffix_draft needs async speculation"
+            assert not self.use_eagle, "suffix_draft does not support EAGLE (no draft activations for suffix tokens)"
         if self.speculate: 
             draft = self.draft
             self.draft_hf_config = AutoConfig.from_pretrained(draft)

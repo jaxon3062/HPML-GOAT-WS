@@ -107,7 +107,7 @@ class SpeculatorAsync(SpeculatorBase):
             print(f"{sep}\n", flush=True)
 
         eagle = verify_result.eagle_acts is not None
-        speculations_tokens, logits_q, cache_hits = self._speculation_request(seqs, eagle)
+        speculations_tokens, logits_q, cache_hits, suffix_rows = self._speculation_request(seqs, eagle)
 
         # Build speculations using pre-allocated buffers (avoids torch.tensor(device=cuda) sync)
         B = len(seqs)
@@ -126,7 +126,7 @@ class SpeculatorAsync(SpeculatorBase):
             seq.last_token = seq.token_ids[-1]
             seq.num_draft_cached_tokens += len(speculations_tokens[i]) + 1
 
-        return SpeculateResult(speculations, logits_q, cache_hits)
+        return SpeculateResult(speculations, logits_q, cache_hits, suffix_rows)
 
     def _speculation_request(self, seqs: list[Sequence], eagle: bool):
         B = len(seqs)
@@ -181,8 +181,10 @@ class SpeculatorAsync(SpeculatorBase):
 
         # Recv into pre-allocated buffers
         dist.recv(self._fused_response, src=self.draft_runner_rank, group=self.async_pg)
-        cache_hits = self._fused_response[:B]
+        codes = self._fused_response[:B]  # bit 0: cache hit, bit 1: suffix-tree speculation
+        cache_hits = codes & 1
+        suffix_rows = codes >> 1
         speculations = self._fused_response[B:].view(B, self.K)
         dist.recv(self._logits_q, src=self.draft_runner_rank, group=self.async_pg)
 
-        return speculations, self._logits_q, cache_hits
+        return speculations, self._logits_q, cache_hits, suffix_rows

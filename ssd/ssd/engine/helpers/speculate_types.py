@@ -9,6 +9,7 @@ class SpeculateResult:
     speculations: torch.Tensor
     logits_q: torch.Tensor
     cache_hits: torch.Tensor | None = None
+    suffix_rows: torch.Tensor | None = None  # [B] 1 where the speculation came from the suffix tree
 
 
 @dataclass

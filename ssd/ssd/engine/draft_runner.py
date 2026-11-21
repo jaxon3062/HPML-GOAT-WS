@@ -10,7 +10,7 @@ from ssd.utils.context import set_context, reset_context
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
 from ssd.utils.async_helpers.nccl_pack import recv_int64
 from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
-from ssd.utils.suffix_fanout import SuffixFanout
+from ssd.utils.suffix_fanout import SuffixLookup, pad_draft
 
 PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
 
@@ -43,7 +43,8 @@ class DraftRunner(ModelRunner):
                 "EAGLE requires jit_speculate=True (cache misses need draft activations)"
 
         if self.is_draft and self.draft_async:
-            self._suffix = SuffixFanout(self.config.speculate_k, self.config.suffix_min_match_len) if self.config.suffix_fanout else None
+            use_suffix = self.config.suffix_fanout or self.config.suffix_draft != "off"
+            self._suffix = SuffixLookup(self.config.speculate_k, self.config.suffix_min_match_len, self.config.suffix_global_requests) if use_suffix else None
             self._suffix_hits = 0
             self._reset_tree_cache_tensors()
             self._init_prealloc_buffers()
@@ -213,6 +214,11 @@ class DraftRunner(ModelRunner):
         
         # Statistics
         ttl += int(B)
+
+        if self._suffix is not None:
+            for sid, keep, _ in request_keys.tolist():
+                self._suffix.advance(sid, keep)
+        sfx, sfx_drafts = None, {}
         
         if self.config.verbose:
             print(f"[hit_cache_and_respond] Request keys: {request_keys}", flush=True)
@@ -229,6 +235,8 @@ class DraftRunner(ModelRunner):
             ttl_hit += int(cache_hits.sum().item())
             if self.tree_cache_boosted is not None:
                 self._suffix_hits += int((match & self.tree_cache_boosted).any(dim=1).sum().item())
+            sfx, sfx_drafts = self._suffix_choose(request_keys, cache_hits)
+            covered = cache_hits if sfx is None else cache_hits | sfx
             
             if self.config.verbose:
                 print(f"[hit_cache_and_respond] Cache hits: {cache_hits.sum().item()}/{B}", flush=True)
@@ -250,7 +258,7 @@ class DraftRunner(ModelRunner):
                     print(f"    [{i}]: key=({seq_id}, {k_idx}, {rec_token}) -> value=('{rec_text}') {hit_marker}", flush=True)
             
             # Fill hits
-            if (cache_hits.any() and not self.config.jit_speculate) or (cache_hits.all() and self.config.jit_speculate):
+            if (cache_hits.any() and not self.config.jit_speculate) or (covered.all() and self.config.jit_speculate):
                 # print(f'[hit_cache_and_respond] got all cache hits, using cached logits and tokens', flush=True)
                 # [B], arbitrary if no match but masked out
                 idx = match.float().argmax(dim=1).to(torch.int64)
@@ -276,7 +284,9 @@ class DraftRunner(ModelRunner):
                     ) # write into out_logits, out_tokens
                 if self.config.use_eagle:
                     out_activations = jit_acts
-        elif self.config.jit_speculate:
+        else:
+            sfx, sfx_drafts = self._suffix_choose(request_keys, cache_hits)
+        if self.tree_cache_keys.numel() == 0 and self.config.jit_speculate and (sfx is None or not sfx.all()):
             # Cache is empty (first iteration), must JIT all
             if self.config.verbose:
                 print(f"[hit_cache_and_respond] Cache empty, running JIT speculate for all", flush=True)
@@ -292,9 +302,37 @@ class DraftRunner(ModelRunner):
             if self.config.use_eagle:
                 out_activations = jit_acts
             
+        if sfx_drafts:
+            # The suffix tree's continuation becomes the speculation; one-hot q keeps
+            # the target's ratio acceptance exact. The glue decode below then runs the
+            # draft model over these tokens, so the fan-out builds on them as usual.
+            rows = list(sfx_drafts)
+            toks = torch.tensor(list(sfx_drafts.values()), dtype=torch.int64, device=self.device)
+            out_tokens[rows] = toks.to(out_tokens.dtype)
+            one_hot = torch.full((len(rows), K, V), float("-inf"), dtype=out_logits.dtype, device=self.device)
+            out_logits[rows] = one_hot.scatter_(2, toks.unsqueeze(2), 0.0)
+
         rec_toks = request_keys[:, 2]
         
-        return out_tokens, out_logits, make_glue_decode_input_ids(out_tokens, rec_toks), cache_hits, out_activations
+        return out_tokens, out_logits, make_glue_decode_input_ids(out_tokens, rec_toks), cache_hits, out_activations, sfx
+
+    def _suffix_choose(self, request_keys, cache_hits):
+        """suffix_draft: picks the rows whose speculation comes from the suffix tree.
+        Returns ([B] bool tensor or None if off, {row: K padded tokens})."""
+        mode = self.config.suffix_draft
+        if mode == "off":
+            return None, {}
+        hits = cache_hits.tolist()
+        drafts = {}
+        for i, (sid, _, rec) in enumerate(request_keys.tolist()):
+            if mode == "miss" and hits[i]:
+                continue
+            toks, score = self._suffix.draft(sid, rec)
+            if toks and score >= self.config.suffix_draft_min_score:
+                drafts[i] = pad_draft(toks, self.config.speculate_k)
+        sfx = torch.zeros(len(hits), dtype=torch.bool, device=self.device)
+        sfx[list(drafts)] = True
+        return sfx, drafts
 
     def _service_spec_request(self):
         """Receives a speculation request, serves it from cache, and sends results back in a single response."""
@@ -353,7 +391,7 @@ class DraftRunner(ModelRunner):
                     print(f"  Seq {seq_id}: keep_idx={keep_idx}, recovery_token={rec_token_target} ('{rec_token_text}'), n_ext={n_ext}", flush=True)
                 print(f"{'='*80}\n", flush=True)
 
-        out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations = self.hit_cache_and_respond(
+        out_tokens, out_logits, glue_decode_input_ids, cache_hits, out_activations, sfx = self.hit_cache_and_respond(
             cache_keys, B, K, num_tokens, temperatures, draft_block_tables, target_recovery_activations)
 
         if self.config.verbose:
@@ -368,7 +406,10 @@ class DraftRunner(ModelRunner):
                     print(f"    Detokenized: {tokens_text}", flush=True)
             print(f"", flush=True)
 
-        fused_response = torch.cat([cache_hits.reshape(-1), out_tokens.reshape(-1).to(torch.int64)])
+        codes = cache_hits.reshape(-1).to(torch.int64)
+        if sfx is not None:
+            codes = codes + 2 * sfx.to(torch.int64)  # bit 1 tells the target the row is a suffix draft
+        fused_response = torch.cat([codes, out_tokens.reshape(-1).to(torch.int64)])
         dist.send(fused_response, dst=0, group=self.async_pg)
         dist.send(out_logits[:, :K, :].contiguous(), dst=0, group=self.async_pg)
 
@@ -387,7 +428,10 @@ class DraftRunner(ModelRunner):
         }
         if self._suffix is not None:
             # Read back to CPU now, before the glue decode is queued behind it.
-            partial_tree_decode_args["suffix_req"] = (cache_keys.tolist(), out_tokens.tolist())
+            keys, outs = cache_keys.tolist(), out_tokens.tolist()
+            for (sid, _, rec), out in zip(keys, outs):
+                self._suffix.remember(sid, rec, out[:K])
+            partial_tree_decode_args["suffix_req"] = (keys, outs)
 
         return glue_decode_input_ids, partial_tree_decode_args
 
@@ -664,10 +708,10 @@ class DraftRunner(ModelRunner):
 
         # Suffix-tree lookups run on CPU while the glue decode runs on GPU.
         boost = None
-        if self._suffix is not None:
+        if self.config.suffix_fanout:
             keys, outs = partial_tree_decode_args["suffix_req"]
             boost = torch.tensor(
-                [self._suffix.nominate(sid, keep, rec, out[:K]) for (sid, keep, rec), out in zip(keys, outs)],
+                [self._suffix.nominate(sid, rec, out[:K]) for (sid, _, rec), out in zip(keys, outs)],
                 dtype=torch.int64, device=self.device)
 
         # --- Extract K+1 logits/prenorms at rec+spec positions ---
@@ -949,7 +993,7 @@ class DraftRunner(ModelRunner):
                 if self._draft_step_times:
                     avg_ms = sum(self._draft_step_times) * 1000 / len(self._draft_step_times)
                     print(f"[metrics] Avg draft step time (ms): {avg_ms:.2f}", flush=True)
-                if self._suffix is not None:
+                if self.config.suffix_fanout:
                     print(f"[metrics] Suffix fan-out: {self._suffix.num_nominated} nominations, "
                           f"{self._suffix_hits} of {ttl_hit} cache hits on a nominated entry", flush=True)
                 self.exit()

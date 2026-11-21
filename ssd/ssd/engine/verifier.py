@@ -93,13 +93,18 @@ class Verifier(VerifierBase):
         temperatures_target = torch.tensor(temps_target, dtype=torch.float32, device=self.device)
         temperatures_draft = torch.tensor(temps_draft, dtype=torch.float32, device=self.device)
 
+        verify_hits = speculate_result.cache_hits
+        if speculate_result.suffix_rows is not None:
+            # Suffix rows carry one-hot logits_q, so ratio acceptance on them is exact.
+            verify_hits = verify_hits | speculate_result.suffix_rows
+
         new_suffixes, recovery_tokens = verify(
             logits_p=logits_p,
             logits_q=speculate_result.logits_q,
             speculations=speculate_result.speculations,
             temperatures_target=temperatures_target,
             temperatures_draft=temperatures_draft,
-            cache_hits=speculate_result.cache_hits,
+            cache_hits=verify_hits,
             sampler_x=self.sampler_x,
             async_fan_out=self.async_fan_out,
             jit_speculate=self.jit_speculate,
@@ -131,8 +136,12 @@ class Verifier(VerifierBase):
         if speculate_result.cache_hits is not None:
             _ch_cpu = speculate_result.cache_hits.cpu()
             self.metrics["cache_hits"].append(_ch_cpu.float().mean().item())
+            _sr_cpu = speculate_result.suffix_rows.cpu() if speculate_result.suffix_rows is not None else torch.zeros_like(_ch_cpu)
+            self.metrics["suffix_draft_rows"].append(_sr_cpu.float().mean().item())
             for i, suffix_len in enumerate([len(s) for s in new_suffixes]):
-                if _ch_cpu[i] == 1:
+                if _sr_cpu[i] == 1:
+                    self.metrics["accepted_suffix_lens_on_suffix_draft"].append(suffix_len)
+                elif _ch_cpu[i] == 1:
                     self.metrics["accepted_suffix_lens_on_hit"].append(suffix_len)
                 else:
                     self.metrics["accepted_suffix_lens_on_miss"].append(suffix_len)

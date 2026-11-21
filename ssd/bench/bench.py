@@ -40,6 +40,11 @@ def parse_arguments():
     parser.add_argument("--backup", type=str, choices=["jit", "fast"], default="jit", help="Backup strategy (jit or fast)")
     parser.add_argument("--suffix", action="store_true", help="Suffix-tree nominated fan-out (needs --spec --async and arctic-inference)")
     parser.add_argument("--suffix_min_match", type=int, default=3, help="Minimum matched context length for a suffix nomination")
+    parser.add_argument("--suffix_draft", type=str, choices=["off", "miss", "always"], default="off",
+                        help="SuffixDecoding as the drafter: replace the speculation on cache misses (miss) or on any row (always)")
+    parser.add_argument("--suffix_draft_min_score", type=float, default=1.0,
+                        help="Use a suffix draft only if its score (expected accepted tokens) is at least this")
+    parser.add_argument("--suffix_global", type=int, default=0, help="Shared suffix tree of past responses: 0 off, -1 unlimited, N = last N requests")
 
     # Memory and batching configuration
     parser.add_argument("--block_sz", type=int, default=256, help="KV cache block size (see config.py: kvcache_block_size)")
@@ -95,8 +100,10 @@ def create_run_name(args):
     spec_mode_str = "spec" if args.spec else "normal"
     async_mode_str = "_async" if getattr(args, 'async', False) else ""
     jit_mode_str = "_jit" if args.backup == "jit" else ""
+    if args.suffix_draft != "off":
+        jit_mode_str += f"_sdraft{args.suffix_draft}{args.suffix_draft_min_score}"
     if args.suffix:
-        jit_mode_str += f"_suffix{args.suffix_min_match}"
+        jit_mode_str += f"_suffix{args.suffix_min_match}" + (f"_g{args.suffix_global}" if args.suffix_global else "")
     model_type = "llama" if args.llama else "qwen"
     example_str = "_example" if args.example else ""
     humaneval_str = "_humaneval" if args.humaneval else ""
@@ -136,6 +143,9 @@ def initialize_wandb(args, run_name):
             "jit_speculative": args.backup == "jit",
             "suffix_fanout": args.suffix,
             "suffix_min_match_len": args.suffix_min_match,
+            "suffix_global_requests": args.suffix_global,
+            "suffix_draft": args.suffix_draft,
+            "suffix_draft_min_score": args.suffix_draft_min_score,
             "k": args.k if args.spec else None,
             "f": args.f,
             "fan_out_list": args.flh,
@@ -181,6 +191,9 @@ def create_llm_kwargs(args, draft_path):
         jit_speculate=(args.backup == "jit"),
         suffix_fanout=args.suffix,
         suffix_min_match_len=args.suffix_min_match,
+        suffix_global_requests=args.suffix_global,
+        suffix_draft=args.suffix_draft,
+        suffix_draft_min_score=args.suffix_draft_min_score,
         max_steps=args.max_steps,
     )
 
@@ -225,6 +238,10 @@ def log_wandb_metrics(args, metrics, total_tokens, total_time, throughput, model
         if "accepted_suffix_lens_with_recovery" in metrics and metrics["accepted_suffix_lens_with_recovery"]:
             wandb_metrics["metrics_avg_accepted_suffix_lens_with_recovery"] = sum(metrics["accepted_suffix_lens_with_recovery"]) / len(metrics["accepted_suffix_lens_with_recovery"])
             wandb_metrics["metrics_accepted_suffix_lens_with_recovery_histogram"] = wandb.Histogram(metrics["accepted_suffix_lens_with_recovery"])
+
+        for k in ("suffix_draft_rows", "accepted_suffix_lens_on_suffix_draft", "accepted_suffix_lens_on_miss"):
+            if metrics.get(k):
+                wandb_metrics[f"metrics_avg_{k}"] = sum(metrics[k]) / len(metrics[k])
 
         if "accepted_suffix_lens_on_hit" in metrics and metrics["accepted_suffix_lens_on_hit"]:
             wandb_metrics["metrics_avg_accepted_suffix_lens_on_hit"] = sum(metrics["accepted_suffix_lens_on_hit"]) / len(metrics["accepted_suffix_lens_on_hit"])
