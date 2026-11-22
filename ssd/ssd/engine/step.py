@@ -10,6 +10,7 @@ from ssd.engine.sequence import Sequence
 from ssd.engine.scheduler import Scheduler
 from ssd.engine.helpers.speculate_types import SpeculatorBase, VerifierBase, VerifyResult
 from ssd.utils.misc import decode_tokens
+from ssd.utils.nvtx import nvtx_range
 
 
 class InferenceStep(ABC):
@@ -37,13 +38,15 @@ class AutoRegressiveStep(InferenceStep):
         if __debug__:
             print(f'[auto_regressive_step] is_prefill={is_prefill}', flush=True)
 
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        with nvtx_range("target:prefill" if is_prefill else "target:ar_decode"):
+            token_ids = self.model_runner.call("run", seqs, is_prefill)
 
         if __debug__:
             decoded_tokens = decode_tokens(token_ids, self.tokenizer)
             print(f"[auto_regressive_step] generated tokens: {decoded_tokens}", flush=True)
 
-        self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        with nvtx_range("target:postprocess"):
+            self.scheduler.postprocess(seqs, token_ids, is_prefill)
         return len(seqs) if not is_prefill else sum(len(seq) for seq in seqs)
 
     def prefill(self, seqs: list[Sequence]) -> int:
@@ -73,13 +76,14 @@ class SpecDecodeStep(InferenceStep):
 
     def prefill(self, seqs: list[Sequence]) -> int:
         # When doing async speculation and not Eagle, we can do draft and target prefills in parallel.
-        if not self.eagle and self.async_spec:
-            empty_verify_result = VerifyResult([], [], None)
-            self.speculator.prefill(seqs, empty_verify_result)
-            verify_result = self.verifier.prefill(seqs, eagle=False)
-        else:
-            verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
-            self.speculator.prefill(seqs, verify_result)
+        with nvtx_range("target:prefill"):
+            if not self.eagle and self.async_spec:
+                empty_verify_result = VerifyResult([], [], None)
+                self.speculator.prefill(seqs, empty_verify_result)
+                verify_result = self.verifier.prefill(seqs, eagle=False)
+            else:
+                verify_result = self.verifier.prefill(seqs, eagle=self.eagle)
+                self.speculator.prefill(seqs, verify_result)
 
         for seq in seqs:
             assert seq.recovery_token_id is not None
@@ -107,7 +111,8 @@ class SpecDecodeStep(InferenceStep):
             eagle_acts=eagle_sentinel,
         )
         #### STEP 1: SPECULATE ####
-        speculate_result = self.speculator.speculate(seqs, in_verify_result)
+        with nvtx_range("target:handshake"):
+            speculate_result = self.speculator.speculate(seqs, in_verify_result)
 
         if _prof:
             torch.cuda.synchronize()
@@ -123,7 +128,8 @@ class SpecDecodeStep(InferenceStep):
                 print(f"[SpecDecodeStep] speculation {i}: {decoded_tokens}", flush=True)
 
         #### STEP 2: VERIFY ####
-        out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
+        with nvtx_range("target:verify"):
+            out_verify_result = self.verifier.verify(seqs, speculate_result, eagle=self.eagle)
 
         if _prof:
             torch.cuda.synchronize()
@@ -145,12 +151,13 @@ class SpecDecodeStep(InferenceStep):
             seq.num_cached_tokens = orig_nct
 
         #### STEP 3: POSTPROCESS ####
-        self.scheduler.postprocess_speculate(
-            seqs,
-            out_verify_result.new_suffixes,
-            out_verify_result.recovery_tokens,
-            eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
-        )
+        with nvtx_range("target:postprocess"):
+            self.scheduler.postprocess_speculate(
+                seqs,
+                out_verify_result.new_suffixes,
+                out_verify_result.recovery_tokens,
+                eagle_acts=out_verify_result.eagle_acts if self.eagle else None,
+            )
 
         if _prof:
             torch.cuda.synchronize()
