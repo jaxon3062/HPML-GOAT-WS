@@ -18,7 +18,9 @@ from dataclasses import fields
 from time import perf_counter
 from tqdm.auto import tqdm
 from transformers import AutoTokenizer
+import torch
 import torch.multiprocessing as mp
+from ssd.utils.nvtx import nvtx_range, profile_window
 
 
 
@@ -341,15 +343,29 @@ class LLMEngine:
         i = 0
         max_steps = self.config.max_steps if self.config.max_steps is not None else float('inf')
         _stream_lens = {}
+        _window = profile_window()
+        _capturing = False
         while not self.is_finished() and i < max_steps:
             if self.config.verbose:
                 print(f"[generate] step {i+1}" +
                     f" of {max_steps}" if max_steps != float('inf') else "",
                     flush=True,
                 )
+            if _window is not None:
+                if i == _window[0] and not _capturing:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStart()
+                    _capturing = True
+                    print(f"[profile_window] cudaProfilerStart at step {i}", flush=True)
+                elif i == _window[1] and _capturing:
+                    torch.cuda.synchronize()
+                    torch.cuda.cudart().cudaProfilerStop()
+                    _capturing = False
+                    print(f"[profile_window] cudaProfilerStop at step {i}", flush=True)
             i += 1
             t = perf_counter()
-            output = self.step(inference_step)
+            with nvtx_range(f"step {i}"):
+                output = self.step(inference_step)
             time_taken = perf_counter() - t
             METRICS["target_step_times"].append(time_taken)
 

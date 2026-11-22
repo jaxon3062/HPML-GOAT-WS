@@ -10,6 +10,7 @@ from ssd.utils.context import set_context, reset_context
 from ssd.utils.async_helpers.async_spec_helpers import get_forked_recovery_tokens_from_logits, make_glue_decode_input_ids
 from ssd.utils.async_helpers.nccl_pack import recv_int64
 from ssd.engine.helpers.cudagraph_helpers import flush_draft_profile
+from ssd.utils.nvtx import nvtx_range
 
 PROFILE_DRAFT = os.environ.get("SSD_PROFILE_DRAFT", "0") == "1"
 
@@ -121,8 +122,12 @@ class DraftRunner(ModelRunner):
         self._arange_kp1 = torch.arange(K + 1, device=d, dtype=torch.int64)
         self._arange_2kp1 = torch.arange(2 * K + 1, device=d, dtype=torch.int64)
 
-    def jit_speculate(self, 
-                      request_keys: torch.Tensor, 
+    def jit_speculate(self, *args, **kwargs):
+        with nvtx_range("draft:jit"):
+            return self._jit_speculate_impl(*args, **kwargs)
+
+    def _jit_speculate_impl(self,
+                      request_keys: torch.Tensor,
                       num_tokens: torch.Tensor, 
                       out_logits: torch.Tensor, 
                       out_tokens: torch.Tensor, 
@@ -881,7 +886,8 @@ class DraftRunner(ModelRunner):
                     torch.cuda.synchronize()
                     _d0 = time.perf_counter()
 
-                glue_decode_input_ids, partial_tree_decode_args = self._service_spec_request()
+                with nvtx_range("draft:service"):
+                    glue_decode_input_ids, partial_tree_decode_args = self._service_spec_request()
 
                 if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()
@@ -889,21 +895,24 @@ class DraftRunner(ModelRunner):
 
                 self._reset_tree_cache_tensors()
 
-                tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)
+                with nvtx_range("draft:build_tree"):
+                    tree_decode_args = self._build_tree_batch(partial_tree_decode_args, glue_decode_input_ids)
 
                 if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()
                     _d2 = time.perf_counter()
 
                 # Decode the branch tree
-                tokens, logits, activations = self._decode_tree(tree_decode_args)
+                with nvtx_range("draft:decode_tree"):
+                    tokens, logits, activations = self._decode_tree(tree_decode_args)
 
                 if _prof or PROFILE_DRAFT:
                     torch.cuda.synchronize()
                     _d3 = time.perf_counter()
 
                 # Populate the local cache so future spec-requests can hit
-                self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
+                with nvtx_range("draft:populate"):
+                    self._populate_tree_cache(tree_decode_args, tokens, logits, tree_decode_args["cache_hits"], activations)
                 self._draft_step_times.append(time.perf_counter() - _ds0)
 
                 if _prof or PROFILE_DRAFT:
