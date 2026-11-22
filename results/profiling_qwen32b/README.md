@@ -4,7 +4,11 @@ Target Qwen3-32B (TP=2, GPUs 0-1), draft Qwen3-0.6B. Same settings as the team's
 `ar_qwen32b_tp2`, `sd_qwen32b_k5_tp2` (k=5) and `ssd_qwen32b_tp2_3gpu` (k=7, f=3, draft on GPU 2),
 b=1, temp=0, `--all` datasets, but short runs (128 output tokens) for profiling.
 
-W&B (HPML-GOAT/ssd, group `profiling`):
+W&B report (throughput, speculation quality, timelines, per-step breakdown):
+https://forge.coreweave.com/wandb/HPML-GOAT/ssd/reports/Speculative-Speculative-Decoding:-throughput-and-profiling--VmlldzoxODM0Njg4OA
+(rebuilt by `ssd/profiling/build_report.py`; needs `pip install wandb-workspaces`).
+
+W&B runs (HPML-GOAT/ssd, group `profiling`):
 
 | Run | What | W&B id |
 |---|---|---|
@@ -37,7 +41,8 @@ SD detail: the draft runs only on GPU 0, so GPU 1 sits idle ~50% of the time whi
 ## Files
 
 - `*_timeline.png`: per-GPU timelines (12 decode steps from the middle of the captured window).
-- `ssd/profiling/`: `nsys_to_wandb.py`, `log_profile_to_wandb.py`, `run_qwen32b_profiling.sh`, `prof_env.sh`.
+- `ssd/profiling/`: `nsys_to_wandb.py`, `log_profile_to_wandb.py`, `run_qwen32b_profiling.sh`, `prof_env.sh`,
+  and `build_report.py` (rebuilds the W&B report above; `--dry-run` to preview, backs up the old spec first).
 - Code changes (all opt-in): `ssd/ssd/utils/nvtx.py` plus NVTX ranges in `engine/step.py`,
   `engine/draft_runner.py` and `engine/llm_engine.py`. `SSD_NVTX=1` turns on the ranges;
   `SSD_PROFILE_WINDOW=a:b` calls cudaProfilerStart/Stop at decode steps a and b.
